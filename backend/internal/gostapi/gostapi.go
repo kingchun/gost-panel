@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -64,32 +65,35 @@ func (c *Client) Request(method, path string, body any) (int, json.RawMessage) {
 
 // listNames 从 /config/services、/config/chains 提取名字集合，
 // 兼容 {"data":{"list":[...]}} 与裸数组两种返回格式。
-func listNames(code int, raw json.RawMessage) map[string]bool {
-	names := map[string]bool{}
-	if code != 200 || raw == nil {
-		return names
-	}
+func listNames(raw json.RawMessage) (map[string]bool, error) {
 	type obj struct {
 		Name string `json:"name"`
 	}
 	var wrapped struct {
-		Data struct {
-			List []obj `json:"list"`
+		Data *struct {
+			List json.RawMessage `json:"list"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal(raw, &wrapped); err == nil && len(wrapped.Data.List) > 0 {
-		for _, o := range wrapped.Data.List {
-			names[o.Name] = true
+	if err := json.Unmarshal(raw, &wrapped); err == nil && wrapped.Data != nil && wrapped.Data.List != nil {
+		var list []obj
+		if err := json.Unmarshal(wrapped.Data.List, &list); err != nil {
+			return nil, fmt.Errorf("列表字段格式无效")
 		}
-		return names
-	}
-	var list []obj
-	if err := json.Unmarshal(raw, &list); err == nil {
+		names := make(map[string]bool, len(list))
 		for _, o := range list {
 			names[o.Name] = true
 		}
+		return names, nil
 	}
-	return names
+	var list []obj
+	if err := json.Unmarshal(raw, &list); err == nil && list != nil {
+		names := make(map[string]bool, len(list))
+		for _, o := range list {
+			names[o.Name] = true
+		}
+		return names, nil
+	}
+	return nil, fmt.Errorf("响应格式无效")
 }
 
 func handlerTypeOf(r store.Rule) string {
@@ -99,16 +103,22 @@ func handlerTypeOf(r store.Rule) string {
 	return "tcp"
 }
 
-// svcName 返回规则对应的 gost 服务名：优先用 GostName（导入时保留原服务名），否则按 ID 生成。
-func svcName(r store.Rule) string {
+type ruleNames struct {
+	service string
+	chain   string
+	node    string
+}
+
+// serviceBaseName 返回规则的首选 gost 服务名。
+func serviceBaseName(r store.Rule) string {
 	if r.GostName != "" {
 		return r.GostName
 	}
 	return fmt.Sprintf("svc-%d", r.ID)
 }
 
-// chainName 返回规则对应的 gost 链名。
-func chainName(r store.Rule) string {
+// chainBaseName 返回规则的首选 gost 链名。
+func chainBaseName(r store.Rule) string {
 	if r.GostName != "" {
 		// svc-N -> chn-N
 		return strings.Replace(r.GostName, "svc-", "chn-", 1)
@@ -116,19 +126,86 @@ func chainName(r store.Rule) string {
 	return fmt.Sprintf("chn-%d", r.ID)
 }
 
-// nodeName 返回节点名。
-func nodeName(r store.Rule) string {
+// nodeBaseName 返回规则的首选 gost 节点名。
+func nodeBaseName(r store.Rule) string {
 	if r.GostName != "" {
 		return strings.Replace(r.GostName, "svc-", "n-", 1)
 	}
 	return fmt.Sprintf("n-%d", r.ID)
 }
 
+// allocateRuleNames 为启用规则分配稳定且不重复的 service、chain、node 名称。
+// 显式保存的 GostName 优先保留；同名时按规则 ID 决定保留者，后续规则追加 ID 后缀。
+func allocateRuleNames(rules []store.Rule) map[int]ruleNames {
+	ordered := append([]store.Rule(nil), rules...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		iExplicit := ordered[i].GostName != ""
+		jExplicit := ordered[j].GostName != ""
+		if iExplicit != jExplicit {
+			return iExplicit
+		}
+		if ordered[i].ID != ordered[j].ID {
+			return ordered[i].ID < ordered[j].ID
+		}
+		if ordered[i].GostName != ordered[j].GostName {
+			return ordered[i].GostName < ordered[j].GostName
+		}
+		return ordered[i].Name < ordered[j].Name
+	})
+
+	usedServices := map[string]bool{}
+	usedChains := map[string]bool{}
+	usedNodes := map[string]bool{}
+	allocated := make(map[int]ruleNames, len(ordered))
+	for _, r := range ordered {
+		if r.Enabled == 0 {
+			continue
+		}
+		allocated[r.ID] = ruleNames{
+			service: uniqueName(serviceBaseName(r), r.ID, usedServices),
+			chain:   uniqueName(chainBaseName(r), r.ID, usedChains),
+			node:    uniqueName(nodeBaseName(r), r.ID, usedNodes),
+		}
+	}
+	return allocated
+}
+
+func uniqueName(base string, id int, used map[string]bool) string {
+	if !used[base] {
+		used[base] = true
+		return base
+	}
+
+	candidate := fmt.Sprintf("%s-%d", base, id)
+	for suffix := 2; used[candidate]; suffix++ {
+		candidate = fmt.Sprintf("%s-%d-%d", base, id, suffix)
+	}
+	used[candidate] = true
+	return candidate
+}
+
+// svcName 返回单条规则的首选服务名，保留给客户端命令等单规则调用。
+func svcName(r store.Rule) string { return serviceBaseName(r) }
+
+// chainName 返回单条规则的首选链名。
+func chainName(r store.Rule) string { return chainBaseName(r) }
+
+// nodeName 返回单条规则的首选节点名。
+func nodeName(r store.Rule) string { return nodeBaseName(r) }
+
 // buildTunnel 构造隧道规则对应的 chain + service。
 func buildTunnel(r store.Rule) (chain, svc map[string]any) {
-	sname := svcName(r)
-	cname := chainName(r)
-	nname := nodeName(r)
+	return buildTunnelNamed(r, ruleNames{
+		service: svcName(r),
+		chain:   chainName(r),
+		node:    nodeName(r),
+	})
+}
+
+func buildTunnelNamed(r store.Rule, names ruleNames) (chain, svc map[string]any) {
+	sname := names.service
+	cname := names.chain
+	nname := names.node
 	node := map[string]any{
 		"name":      nname,
 		"addr":      fmt.Sprintf("%s:%d", r.TargetHost, r.TargetPort),
@@ -161,15 +238,22 @@ func buildTunnel(r store.Rule) (chain, svc map[string]any) {
 
 // buildForward 构造普通端口转发 service。
 func buildForward(r store.Rule) map[string]any {
+	return buildForwardNamed(r, ruleNames{
+		service: svcName(r),
+		node:    nodeName(r),
+	})
+}
+
+func buildForwardNamed(r store.Rule, names ruleNames) map[string]any {
 	ht := handlerTypeOf(r)
 	return map[string]any{
-		"name":     svcName(r),
+		"name":     names.service,
 		"addr":     fmt.Sprintf(":%d", r.ListenPort),
 		"handler":  map[string]any{"type": ht},
 		"listener": map[string]any{"type": ht},
 		"forwarder": map[string]any{
 			"nodes": []any{map[string]any{
-				"name": nodeName(r),
+				"name": names.node,
 				"addr": fmt.Sprintf("%s:%d", r.TargetHost, r.TargetPort),
 			}},
 		},
@@ -185,16 +269,21 @@ func (c *Client) buildFullConfig(rules []store.Rule) map[string]any {
 	}
 	services := []any{}
 	chains := []any{}
+	names := allocateRuleNames(rules)
 	for _, r := range rules {
 		if r.Enabled == 0 {
 			continue
 		}
+		ruleName, ok := names[r.ID]
+		if !ok {
+			continue
+		}
 		if r.Type == "tunnel" {
-			ch, svc := buildTunnel(r)
+			ch, svc := buildTunnelNamed(r, ruleName)
 			chains = append(chains, ch)
 			services = append(services, svc)
 		} else {
-			services = append(services, buildForward(r))
+			services = append(services, buildForwardNamed(r, ruleName))
 		}
 	}
 	return map[string]any{
@@ -211,72 +300,106 @@ func (c *Client) buildFullConfig(rules []store.Rule) map[string]any {
 func (c *Client) Apply(st *store.Store) (int, string) {
 	rules, err := st.ListRules()
 	if err != nil {
-		return 500, "读取规则失败: " + err.Error()
+		return http.StatusInternalServerError, "读取规则失败: " + err.Error()
 	}
 
 	code, raw := c.Request("GET", "/config/services", nil)
-	if code != 200 {
-		return code, fmt.Sprintf("gost API 查询服务失败 (%d)", code)
+	if code != http.StatusOK {
+		return http.StatusBadGateway, fmt.Sprintf("gost API 查询服务列表 /config/services 失败 (%d)", code)
 	}
-	existingSvc := listNames(code, raw)
+	existingSvc, err := listNames(raw)
+	if err != nil {
+		return http.StatusBadGateway, "gost API 服务列表响应无效: " + err.Error()
+	}
 	code, raw = c.Request("GET", "/config/chains", nil)
-	existingChain := listNames(code, raw)
+	if code != http.StatusOK {
+		return http.StatusBadGateway, fmt.Sprintf("gost API 查询转发链列表 /config/chains 失败 (%d)", code)
+	}
+	existingChain, err := listNames(raw)
+	if err != nil {
+		return http.StatusBadGateway, "gost API 转发链列表响应无效: " + err.Error()
+	}
 
 	wantedSvc := map[string]map[string]any{}
 	wantedChain := map[string]map[string]any{}
+	names := allocateRuleNames(rules)
 	for _, r := range rules {
 		if r.Enabled == 0 {
 			continue
 		}
-		sname := svcName(r)
-		cname := chainName(r)
+		ruleName, ok := names[r.ID]
+		if !ok {
+			continue
+		}
+		sname := ruleName.service
+		cname := ruleName.chain
 		if r.Type == "tunnel" {
-			ch, svc := buildTunnel(r)
+			ch, svc := buildTunnelNamed(r, ruleName)
 			wantedChain[cname] = ch
 			wantedSvc[sname] = svc
 		} else {
-			wantedSvc[sname] = buildForward(r)
+			wantedSvc[sname] = buildForwardNamed(r, ruleName)
 		}
 	}
 
 	// 删除多余服务/链
 	for name := range existingSvc {
 		if _, ok := wantedSvc[name]; !ok {
-			c.Request("DELETE", "/config/services/"+name, nil)
+			path := "/config/services/" + name
+			if code, _ := c.Request("DELETE", path, nil); !isSuccessfulStatus(code) {
+				return http.StatusBadGateway, fmt.Sprintf("gost API DELETE %s 失败 (%d)", path, code)
+			}
 		}
 	}
 	for name := range existingChain {
 		if _, ok := wantedChain[name]; !ok {
-			c.Request("DELETE", "/config/chains/"+name, nil)
+			path := "/config/chains/" + name
+			if code, _ := c.Request("DELETE", path, nil); !isSuccessfulStatus(code) {
+				return http.StatusBadGateway, fmt.Sprintf("gost API DELETE %s 失败 (%d)", path, code)
+			}
 		}
 	}
 	// 新增/更新链与服务
 	for name, ch := range wantedChain {
+		method := "POST"
+		path := "/config/chains"
 		if existingChain[name] {
-			c.Request("PUT", "/config/chains/"+name, ch)
-		} else {
-			c.Request("POST", "/config/chains", ch)
+			method = "PUT"
+			path += "/" + name
+		}
+		if code, _ := c.Request(method, path, ch); !isSuccessfulStatus(code) {
+			return http.StatusBadGateway, fmt.Sprintf("gost API %s %s（转发链 %q）失败 (%d)", method, path, name, code)
 		}
 	}
 	for name, svc := range wantedSvc {
+		method := "POST"
+		path := "/config/services"
 		if existingSvc[name] {
-			c.Request("PUT", "/config/services/"+name, svc)
-		} else {
-			c.Request("POST", "/config/services", svc)
+			method = "PUT"
+			path += "/" + name
+		}
+		if code, _ := c.Request(method, path, svc); !isSuccessfulStatus(code) {
+			return http.StatusBadGateway, fmt.Sprintf("gost API %s %s（服务 %q）失败 (%d)", method, path, name, code)
 		}
 	}
 
 	// 持久化：写回 gost 配置文件，防止 gost 重启后丢失
-	c.persist(rules)
-	return 200, fmt.Sprintf("已同步 %d 条规则", len(wantedSvc))
+	if err := c.persist(rules); err != nil {
+		return http.StatusInternalServerError, "写入 gost 配置失败: " + err.Error()
+	}
+	return http.StatusOK, fmt.Sprintf("已同步 %d 条规则", len(wantedSvc))
 }
 
-func (c *Client) persist(rules []store.Rule) {
+func isSuccessfulStatus(code int) bool {
+	return code >= http.StatusOK && code < http.StatusMultipleChoices
+}
+
+func (c *Client) persist(rules []store.Rule) error {
 	b, err := json.MarshalIndent(c.buildFullConfig(rules), "", "  ")
 	if err != nil {
-		return
+		return err
 	}
-	_ = os.WriteFile(c.ConfigPath, b, 0o600)
+	return os.WriteFile(c.ConfigPath, b, 0o600)
 }
 
 // ServiceCount 查询 gost 当前 service 数量（status 页用）。

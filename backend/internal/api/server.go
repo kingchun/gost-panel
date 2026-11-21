@@ -264,7 +264,9 @@ func (s *Server) handleCreateRule(c *gin.Context) {
 	s.st.AddAudit("rule.create", fmt.Sprintf("#%d %s [%s] %s:%d->%s:%d",
 		rid, req.Name, req.Type, req.Proto, req.ListenPort, req.TargetHost, req.TargetPort))
 	if enabled == 1 {
-		s.gost.Apply(s.st)
+		if !s.applyStoredRules(c) {
+			return
+		}
 	}
 	resp.OK(c, gin.H{"id": rid})
 }
@@ -315,7 +317,9 @@ func (s *Server) handleUpdateRule(c *gin.Context) {
 		return
 	}
 	s.st.AddAudit("rule.update", fmt.Sprintf("#%d", rid))
-	s.gost.Apply(s.st)
+	if !s.applyStoredRules(c) {
+		return
+	}
 	resp.OK(c, nil)
 }
 
@@ -335,7 +339,9 @@ func (s *Server) handleDeleteRule(c *gin.Context) {
 		return
 	}
 	s.st.AddAudit("rule.delete", fmt.Sprintf("#%d %s", rid, cur.Name))
-	s.gost.Apply(s.st)
+	if !s.applyStoredRules(c) {
+		return
+	}
 	resp.OK(c, nil)
 }
 
@@ -344,10 +350,33 @@ func (s *Server) handleApply(c *gin.Context) {
 	code, msg := s.gost.Apply(s.st)
 	s.st.AddAudit("rule.apply", msg)
 	if code != 200 {
-		resp.ErrUpstream(c, msg)
+		writeApplyError(c, code, msg)
 		return
 	}
 	resp.OKMsg(c, msg, nil)
+}
+
+// applyStoredRules 同步已经写入面板数据库的规则，并明确报告上游失败。
+func (s *Server) applyStoredRules(c *gin.Context) bool {
+	code, msg := s.gost.Apply(s.st)
+	if code == http.StatusOK {
+		return true
+	}
+	if code == http.StatusBadGateway {
+		msg = "面板规则数据已更新，但同步到 GOST 失败: " + msg
+	} else {
+		msg = "面板规则数据已更新，但同步配置未完成: " + msg
+	}
+	writeApplyError(c, code, msg)
+	return false
+}
+
+func writeApplyError(c *gin.Context, code int, msg string) {
+	if code == http.StatusBadGateway {
+		resp.ErrUpstream(c, msg)
+		return
+	}
+	resp.ErrInternal(c, msg)
 }
 
 // GET /api/gost/services 从 gost 拉取当前运行的服务列表，用于面板比对。
